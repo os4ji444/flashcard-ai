@@ -1,0 +1,5 @@
+{
+  "name": "FlashCardAI",
+  "description": "Upload a PDF to automatically extract images and generate AI-powered flashcards with names and descriptions.",
+  "requestFramePermissions": []
+}
