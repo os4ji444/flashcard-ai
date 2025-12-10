@@ -1,17 +1,25 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FileText, Sparkles, AlertCircle, Loader2, Key, Trash2, Globe, PlayCircle, ArrowLeft, Folder, Plus, RefreshCw, Edit2, Check, Download, Upload as UploadIcon, HardDriveDownload, Eye, CheckSquare, Square } from 'lucide-react';
-import { extractImagesFromPdf } from './services/pdfService';
+import { Upload, FileText, Sparkles, AlertCircle, Loader2, Key, Trash2, Globe, PlayCircle, ArrowLeft, Folder, Plus, RefreshCw, Edit2, Check, Download, Upload as UploadIcon, HardDriveDownload, Eye, CheckSquare, Square, BrainCircuit, Settings, X, Save, EyeOff, RotateCcw, Wrench, Image as ImageIcon, FileCheck, Presentation } from 'lucide-react';
+import { extractImagesFromPdf, convertPdfPagesToImages, createPptxFromPdf } from './services/pdfService';
 import { extractImagesFromPptx } from './services/pptxService';
 import { generateFlashcardContent } from './services/geminiService';
 import { getUserDecks, saveUserDecks, generateBackup, restoreBackup } from './services/storageService';
 import { Flashcard } from './components/Flashcard';
 import { StudyCard } from './components/StudyCard';
 import { CardEditor } from './components/CardEditor';
-import { AppStatus, ExtractedImage, FlashcardData, ProcessingStats, Deck } from './types';
+import { AppStatus, ExtractedImage, FlashcardData, ProcessingStats, Deck, AIConfig } from './types';
+import JSZip from 'jszip';
 
 // Constant ID for local-only usage
 const GUEST_USER_ID = 'guest-user';
+
+const MODEL_PRESETS = [
+    { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+    { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+    { value: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash' },
+    { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+];
 
 export default function App() {
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
@@ -22,6 +30,38 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [targetLanguage, setTargetLanguage] = useState<string>('French');
   
+  // AI Config State
+  const [aiConfig, setAiConfig] = useState<AIConfig>(() => {
+    const saved = localStorage.getItem('flashcard-ai-config');
+    if (saved) {
+        try {
+            return JSON.parse(saved);
+        } catch (e) {
+            console.error("Failed to parse saved config", e);
+        }
+    }
+    // Backward compatibility or default
+    const oldModel = localStorage.getItem('flashcard-ai-model');
+    return {
+        provider: 'google',
+        modelName: oldModel || 'gemini-2.5-flash',
+        apiKey: '',
+        baseUrl: ''
+    };
+  });
+  
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [showRecoveryModal, setShowRecoveryModal] = useState(false);
+  
+  // New Modals
+  const [isToolsOpen, setIsToolsOpen] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  }>({ isOpen: false, title: '', message: '', onConfirm: () => {} });
+
   // Review Mode State
   const [extractedCandidates, setExtractedCandidates] = useState<ExtractedImage[]>([]);
   const [selectedCandidateIds, setSelectedCandidateIds] = useState<Set<string>>(new Set());
@@ -64,6 +104,26 @@ export default function App() {
           setDeckTitleInput(activeDeck.title);
       }
   }, [activeDeckId, activeDeck?.title]);
+
+  // Persist AI config
+  useEffect(() => {
+    localStorage.setItem('flashcard-ai-config', JSON.stringify(aiConfig));
+  }, [aiConfig]);
+
+  // --- Confirmation Logic ---
+  const requestConfirm = (title: string, message: string, onConfirm: () => void) => {
+      setConfirmDialog({ isOpen: true, title, message, onConfirm });
+  };
+  
+  const handleConfirmAction = () => {
+      try {
+        confirmDialog.onConfirm();
+      } catch (e) {
+        console.error("Confirmation action failed", e);
+      } finally {
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+      }
+  };
 
   // --- Backup / Restore ---
   const handleExportData = () => {
@@ -111,10 +171,7 @@ export default function App() {
 
   // --- Deck & File Actions ---
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
+  const processFile = async (file: File) => {
     const fileType = file.name.split('.').pop()?.toLowerCase();
     
     if (fileType !== 'pdf' && fileType !== 'pptx') {
@@ -147,7 +204,7 @@ export default function App() {
       }
 
       if (images.length === 0) {
-        setErrorMsg(`No suitable images found in ${file.name}.`);
+        setErrorMsg(`No suitable images found in ${file.name}. Try converting PDF to PPTX using the Tools menu first.`);
         setStatus(AppStatus.IDLE);
         setDecks(prev => prev.filter(d => d.id !== newDeckId));
         setActiveDeckId(null);
@@ -156,16 +213,7 @@ export default function App() {
 
       setExtractedCandidates(images);
       
-      // Heuristic for default selection:
-      // Select if: > 100x100 pixels AND aspect ratio is normal (not too wide/tall)
-      // AND has some context text (optional, but requested by user to favor images with descriptions)
       const autoSelected = new Set<string>();
-      
-      // We need to load image dimensions to check size, but dataUrl is available.
-      // We'll just assume larger dataUrls might be bigger images, or select all valid ones.
-      // For now, let's select ALL of them initially, or maybe exclude very small files based on string length?
-      // Better heuristic: All images returned by extract service are "technically" valid, 
-      // but let's just select all and let user deselect.
       images.forEach(img => autoSelected.add(img.id));
       
       setSelectedCandidateIds(autoSelected);
@@ -180,18 +228,26 @@ export default function App() {
     }
   };
 
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+        await processFile(file);
+    }
+  };
+
   const handleStartGeneration = () => {
       if (!activeDeckId) return;
 
-      const candidatesToProcess = extractedCandidates.filter(img => selectedCandidateIds.has(img.id));
+      const selected = extractedCandidates.filter(img => selectedCandidateIds.has(img.id));
+      const ignored = extractedCandidates.filter(img => !selectedCandidateIds.has(img.id));
       
-      if (candidatesToProcess.length === 0) {
+      if (selected.length === 0) {
           alert("Please select at least one image to generate flashcards.");
           return;
       }
 
       // Initialize Flashcards
-      const newCards: FlashcardData[] = candidatesToProcess.map(img => ({
+      const newCards: FlashcardData[] = selected.map(img => ({
         id: img.id,
         imageId: img.id,
         imageSrc: img.dataUrl,
@@ -205,8 +261,12 @@ export default function App() {
         nextReview: Date.now()
       }));
 
-      // Update the deck
-      setDecks(prev => prev.map(d => d.id === activeDeckId ? { ...d, cards: newCards } : d));
+      // Update the deck with new cards AND ignored images
+      setDecks(prev => prev.map(d => d.id === activeDeckId ? { 
+          ...d, 
+          cards: newCards,
+          ignoredImages: ignored
+      } : d));
       
       setStats({ totalImages: newCards.length, processedImages: 0 });
       setStatus(AppStatus.GENERATING);
@@ -237,10 +297,36 @@ export default function App() {
         const promises = batch.map(async (card) => {
             updateDeckCards(cards => cards.map(c => c.id === card.id ? { ...c, status: 'generating' } : c));
             
-            const content = await generateFlashcardContent(card.imageSrc, card.contextText, targetLanguage);
+            const content = await generateFlashcardContent(card.imageSrc, card.contextText, targetLanguage, aiConfig);
             
             if (content.isValid === false) {
-                updateDeckCards(cards => cards.filter(c => c.id !== card.id));
+                 // Move to ignoredImages instead of just deleting
+                 setDecks(prevDecks => prevDecks.map(d => {
+                    if (d.id === deckId) {
+                        // Attempt to reconstruct simple ExtractedImage
+                        let pIndex = 0;
+                        const parts = card.id.split('-');
+                        if (card.id.startsWith('pptx-') && parts.length >= 2) {
+                            pIndex = parseInt(parts[1]) || 0;
+                        } else {
+                            pIndex = parseInt(parts[0]) || 0;
+                        }
+
+                        const ignoredImg: ExtractedImage = {
+                            id: card.id,
+                            dataUrl: card.imageSrc,
+                            pageIndex: pIndex,
+                            contextText: card.contextText || ''
+                        };
+
+                        return { 
+                            ...d, 
+                            cards: d.cards.filter(c => c.id !== card.id),
+                            ignoredImages: [...(d.ignoredImages || []), ignoredImg]
+                        };
+                    }
+                    return d;
+                }));
             } else if (content.name === 'Error') {
                 updateDeckCards(cards => cards.map(c => c.id === card.id ? {
                     ...c,
@@ -308,19 +394,63 @@ export default function App() {
     }));
   };
 
+  const handleRecoverImage = (img: ExtractedImage) => {
+      if (!activeDeck) return;
+
+      // 1. Create a new card from the ignored image
+      const newCard: FlashcardData = {
+          id: img.id,
+          imageId: img.id,
+          imageSrc: img.dataUrl,
+          name: 'Recovered Image',
+          description: 'Edit this card to add details.',
+          status: 'completed',
+          contextText: img.contextText,
+          interval: 0,
+          ease: 2.5,
+          reps: 0,
+          nextReview: Date.now()
+      };
+
+      // 2. Update deck: Add to cards, Remove from ignoredImages
+      setDecks(prev => prev.map(d => {
+          if (d.id === activeDeck.id) {
+              return {
+                  ...d,
+                  cards: [...d.cards, newCard],
+                  ignoredImages: d.ignoredImages?.filter(i => i.id !== img.id)
+              };
+          }
+          return d;
+      }));
+
+      // 3. Close recovery modal and open editor for this card
+      setShowRecoveryModal(false);
+      setActiveCardToEdit(newCard);
+      setEditorOpen(true);
+  };
+
   const handleDeleteCard = (cardId: string) => {
     if (!activeDeckId) return;
-    if(window.confirm('Are you sure you want to delete this card?')) {
-       setDecks(prev => prev.map(d => d.id === activeDeckId ? { ...d, cards: d.cards.filter(c => c.id !== cardId) } : d));
-    }
+    requestConfirm(
+        "Delete Card?",
+        "Are you sure you want to delete this flashcard? This cannot be undone.",
+        () => {
+             setDecks(prev => prev.map(d => d.id === activeDeckId ? { ...d, cards: d.cards.filter(c => c.id !== cardId) } : d));
+        }
+    );
   };
 
   const handleDeleteDeck = (e: React.MouseEvent, deckId: string) => {
       e.stopPropagation(); e.preventDefault(); e.nativeEvent.stopImmediatePropagation();
-      if (window.confirm("Delete this deck and all its cards?")) {
-          setDecks(prev => prev.filter(d => d.id !== deckId));
-          if (activeDeckId === deckId) { setActiveDeckId(null); setStatus(AppStatus.IDLE); }
-      }
+      requestConfirm(
+          "Delete Deck?",
+          "Are you sure you want to delete this entire deck and all its cards? This cannot be undone.",
+          () => {
+              setDecks(prev => prev.filter(d => d.id !== deckId));
+              if (activeDeckId === deckId) { setActiveDeckId(null); setStatus(AppStatus.IDLE); }
+          }
+      );
   };
 
   const handleEditDeckFromDashboard = (e: React.MouseEvent, deck: Deck) => {
@@ -379,9 +509,328 @@ export default function App() {
 
   const handleBackToDashboard = () => { setActiveDeckId(null); setStatus(AppStatus.IDLE); setIsEditingDeckTitle(false); };
 
-  // --- RENDERERS ---
+  const handleModelSelectChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+      const val = e.target.value;
+      if (val === 'custom-config') {
+          setIsSettingsOpen(true);
+      } else {
+          // Preset selection (Google)
+          setAiConfig(prev => ({ ...prev, provider: 'google', modelName: val }));
+      }
+  };
 
-  // Review Screen: The new step!
+  // --- COMPONENTS ---
+
+  const ConfirmDialog = () => {
+      if (!confirmDialog.isOpen) return null;
+      return (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-md p-4 animate-in fade-in duration-200 pointer-events-auto">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden flex flex-col scale-100 opacity-100 border border-slate-100">
+                <div className="p-6 text-center">
+                    <div className="w-12 h-12 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <AlertCircle size={24} />
+                    </div>
+                    <h3 className="text-lg font-bold text-slate-900 mb-2">{confirmDialog.title}</h3>
+                    <p className="text-sm text-slate-500">{confirmDialog.message}</p>
+                </div>
+                <div className="flex border-t border-slate-100">
+                    <button 
+                        onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
+                        className="flex-1 py-3 text-slate-600 font-medium hover:bg-slate-50 transition-colors border-r border-slate-100 active:bg-slate-100"
+                    >
+                        Cancel
+                    </button>
+                    <button 
+                        onClick={handleConfirmAction}
+                        className="flex-1 py-3 text-red-600 font-bold hover:bg-red-50 transition-colors active:bg-red-100"
+                    >
+                        Delete
+                    </button>
+                </div>
+            </div>
+        </div>
+      );
+  };
+
+  const RecoveryModal = () => {
+      if (!showRecoveryModal || !activeDeck) return null;
+      
+      const ignored = activeDeck.ignoredImages || [];
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl overflow-hidden flex flex-col h-[85vh]">
+                <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+                    <div>
+                        <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                            <EyeOff size={20} className="text-slate-500" />
+                            Recover Hidden Images
+                        </h2>
+                        <p className="text-sm text-slate-500">
+                            These images were detected but not selected (or rejected by AI). Click 'Recover' to add them to your deck.
+                        </p>
+                    </div>
+                    <button onClick={() => setShowRecoveryModal(false)} className="p-2 hover:bg-slate-200 rounded-full transition-colors">
+                        <X size={20} className="text-slate-500" />
+                    </button>
+                </div>
+
+                <div className="p-6 overflow-y-auto custom-scrollbar flex-1">
+                    {ignored.length === 0 ? (
+                        <div className="h-full flex flex-col items-center justify-center text-slate-400">
+                            <EyeOff size={48} className="mb-4 opacity-50" />
+                            <p>No hidden images found.</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                            {ignored.map(img => (
+                                <div key={img.id} className="relative group bg-white rounded-xl overflow-hidden border border-slate-200 hover:shadow-md transition-all">
+                                    <div className="aspect-square bg-slate-50 p-4 flex items-center justify-center">
+                                        <img src={img.dataUrl} alt="Ignored Candidate" className="max-w-full max-h-full object-contain" />
+                                    </div>
+                                    <div className="p-3 border-t border-slate-100 bg-white flex items-center justify-between">
+                                        <div className="text-xs font-semibold text-slate-500 uppercase">
+                                            Page {img.pageIndex}
+                                        </div>
+                                        <button 
+                                            onClick={() => handleRecoverImage(img)}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-50 text-indigo-600 text-xs font-bold rounded-lg hover:bg-indigo-100 transition-colors"
+                                        >
+                                            <RotateCcw size={14} /> Recover
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+      );
+  };
+
+  const ToolsModal = () => {
+    const [conversionStatus, setConversionStatus] = useState<'idle' | 'processing' | 'done'>('idle');
+    const [progress, setProgress] = useState(0);
+
+    if (!isToolsOpen) return null;
+
+    const handlePdfToPptx = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setConversionStatus('processing');
+        setProgress(0);
+
+        try {
+            // 1. Convert
+            const blob = await createPptxFromPdf(file, (curr, total) => {
+                setProgress(Math.round((curr / total) * 100));
+            });
+            
+            // 2. Auto-process as a "File Upload"
+            const pptxFile = new File([blob], file.name.replace('.pdf', '.pptx'), { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" });
+            
+            // Close modal first
+            setIsToolsOpen(false);
+            setConversionStatus('idle');
+
+            // Trigger main processing
+            await processFile(pptxFile);
+            
+            alert("PDF converted to PowerPoint successfully! Now scanning for images...");
+
+        } catch (err: any) {
+            console.error(err);
+            alert("Conversion failed: " + err.message);
+            setConversionStatus('idle');
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
+                <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+                    <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                        <Wrench size={20} className="text-indigo-600" />
+                        PDF Tools
+                    </h2>
+                    <button onClick={() => setIsToolsOpen(false)} className="p-2 hover:bg-slate-200 rounded-full transition-colors">
+                        <X size={20} className="text-slate-500" />
+                    </button>
+                </div>
+                
+                <div className="p-6">
+                    <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 mb-6">
+                        <h3 className="font-semibold text-blue-800 mb-1 flex items-center gap-2">
+                            <AlertCircle size={18} /> Fix Extraction Issues
+                        </h3>
+                        <p className="text-sm text-blue-700">
+                            If standard PDF extraction misses images, use this tool. It will scan the PDF and recreate it as a PowerPoint file where <b>text and images are separated</b> into distinct, editable elements.
+                        </p>
+                    </div>
+
+                    <div className="space-y-4">
+                        <div className="border-2 border-dashed border-slate-300 rounded-xl p-8 text-center hover:bg-slate-50 transition-colors relative group">
+                            {conversionStatus === 'idle' ? (
+                                <>
+                                    <div className="w-12 h-12 bg-indigo-100 text-indigo-600 rounded-full flex items-center justify-center mx-auto mb-3">
+                                        <Presentation size={24} />
+                                    </div>
+                                    <h3 className="text-lg font-bold text-slate-800">Convert PDF to Deck (via PPTX)</h3>
+                                    <p className="text-slate-500 text-sm mt-1 mb-4">
+                                        Separates text and images automatically.
+                                    </p>
+                                    <div className="inline-block px-4 py-2 bg-indigo-600 text-white rounded-lg font-medium shadow-sm">
+                                        Select PDF File
+                                    </div>
+                                    <input 
+                                        type="file" 
+                                        accept=".pdf"
+                                        onChange={handlePdfToPptx}
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                    />
+                                </>
+                            ) : (
+                                <div className="py-4">
+                                    <Loader2 className="w-10 h-10 text-indigo-600 animate-spin mx-auto mb-4" />
+                                    <h3 className="font-bold text-slate-800">
+                                        {conversionStatus === 'processing' ? `Analyzing Page ${progress}%...` : 'Finalizing...'}
+                                    </h3>
+                                    <p className="text-slate-500 text-sm mt-2">Extracting distinct elements...</p>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+  };
+
+  const AISettingsModal = () => {
+    if (!isSettingsOpen) return null;
+    
+    // Local state for form
+    const [localConfig, setLocalConfig] = useState<AIConfig>(aiConfig);
+
+    const handleSave = () => {
+        setAiConfig(localConfig);
+        setIsSettingsOpen(false);
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
+                <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+                    <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                        <Settings size={20} className="text-indigo-600" />
+                        AI Settings
+                    </h2>
+                    <button onClick={() => setIsSettingsOpen(false)} className="p-2 hover:bg-slate-200 rounded-full transition-colors">
+                        <X size={20} className="text-slate-500" />
+                    </button>
+                </div>
+
+                <div className="p-6 space-y-6">
+                    {/* Provider Selection */}
+                    <div>
+                        <label className="block text-sm font-medium text-slate-700 mb-3">AI Provider</label>
+                        <div className="grid grid-cols-2 gap-3">
+                            <button
+                                type="button" 
+                                onClick={() => setLocalConfig({ ...localConfig, provider: 'google' })}
+                                className={`px-4 py-3 rounded-xl border-2 font-medium transition-all text-sm ${localConfig.provider === 'google' ? 'border-indigo-600 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'}`}
+                            >
+                                Google Gemini
+                            </button>
+                            <button 
+                                type="button"
+                                onClick={() => setLocalConfig({ ...localConfig, provider: 'openai' })}
+                                className={`px-4 py-3 rounded-xl border-2 font-medium transition-all text-sm ${localConfig.provider === 'openai' ? 'border-indigo-600 bg-indigo-50 text-indigo-700' : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'}`}
+                            >
+                                External API
+                            </button>
+                        </div>
+                    </div>
+
+                    {localConfig.provider === 'google' ? (
+                        <div>
+                            <label className="block text-sm font-medium text-slate-700 mb-1">Model Name</label>
+                            <input 
+                                type="text" 
+                                value={localConfig.modelName}
+                                onChange={e => setLocalConfig({...localConfig, modelName: e.target.value})}
+                                className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
+                                placeholder="gemini-2.5-flash"
+                            />
+                            <p className="text-xs text-slate-500 mt-2">
+                                Uses the API Key managed by the app/session. Enter a custom model name here if needed.
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 flex items-start gap-2">
+                                <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                                Use any OpenAI-compatible API (OpenAI, Groq, DeepSeek, LocalAI, etc.)
+                            </div>
+                            
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">Base URL</label>
+                                <input 
+                                    type="text" 
+                                    value={localConfig.baseUrl}
+                                    onChange={e => setLocalConfig({...localConfig, baseUrl: e.target.value})}
+                                    className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
+                                    placeholder="https://api.openai.com/v1"
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">API Key</label>
+                                <input 
+                                    type="password" 
+                                    value={localConfig.apiKey}
+                                    onChange={e => setLocalConfig({...localConfig, apiKey: e.target.value})}
+                                    className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
+                                    placeholder="sk-..."
+                                />
+                            </div>
+
+                            <div>
+                                <label className="block text-sm font-medium text-slate-700 mb-1">Model Name</label>
+                                <input 
+                                    type="text" 
+                                    value={localConfig.modelName}
+                                    onChange={e => setLocalConfig({...localConfig, modelName: e.target.value})}
+                                    className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
+                                    placeholder="gpt-4o"
+                                />
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="pt-4 flex justify-end gap-3">
+                        <button 
+                            onClick={() => setIsSettingsOpen(false)}
+                            className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg transition-colors font-medium"
+                        >
+                            Cancel
+                        </button>
+                        <button 
+                            onClick={handleSave}
+                            className="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors font-medium flex items-center gap-2"
+                        >
+                            <Save size={18} /> Save Settings
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+  };
+
+  // Review Screen
   const renderReviewScreen = () => {
       const selectedCount = selectedCandidateIds.size;
       const toggleSelect = (id: string) => {
@@ -402,9 +851,7 @@ export default function App() {
       
       const handleDeleteCandidate = (e: React.MouseEvent, id: string) => {
           e.stopPropagation();
-          // Remove from candidates list
           setExtractedCandidates(prev => prev.filter(c => c.id !== id));
-          // Remove from selection set
           setSelectedCandidateIds(prev => {
               const next = new Set(prev);
               next.delete(id);
@@ -448,7 +895,6 @@ export default function App() {
                             onClick={() => toggleSelect(img.id)}
                             className={`relative group bg-white rounded-xl overflow-hidden border-2 cursor-pointer transition-all ${isSelected ? 'border-indigo-500 shadow-md ring-2 ring-indigo-100' : 'border-slate-200 opacity-80 hover:opacity-100'}`}
                         >
-                            {/* Selection Checkbox - Moved to Top Left */}
                             <div className="absolute top-2 left-2 z-10">
                                 {isSelected ? (
                                     <div className="bg-indigo-600 text-white p-1 rounded-md shadow-sm">
@@ -461,7 +907,6 @@ export default function App() {
                                 )}
                             </div>
 
-                            {/* Action Buttons (Edit/Delete) - Top Right */}
                             <div className="absolute top-2 right-2 z-10 flex gap-1 bg-white/95 backdrop-blur-sm p-1 rounded-lg border border-slate-200 shadow-sm opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
                                  <button 
                                     className="p-1.5 text-slate-400 hover:text-indigo-600 rounded-md hover:bg-slate-100 transition-colors"
@@ -628,6 +1073,8 @@ export default function App() {
       if (!activeDeck) return null;
       
       const hasErrors = activeDeck.cards.some(c => c.status === 'error');
+      // Always allow access to hidden list if it exists, even if empty (so users know it's there)
+      const ignoredCount = activeDeck.ignoredImages ? activeDeck.ignoredImages.length : 0;
 
       return (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 animate-in fade-in duration-500">
@@ -678,6 +1125,14 @@ export default function App() {
 
                 {status === AppStatus.COMPLETED && (
                     <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
+                         <button
+                            onClick={() => setShowRecoveryModal(true)}
+                            className="flex items-center justify-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 border border-slate-200 rounded-lg hover:bg-slate-200 transition-colors shadow-sm font-medium"
+                            title="View ignored or rejected images"
+                         >
+                            <EyeOff size={18} /> <span className="hidden sm:inline">Hidden ({ignoredCount})</span>
+                         </button>
+
                          {hasErrors && (
                              <button 
                                 onClick={handleRetryErrors}
@@ -783,6 +1238,37 @@ export default function App() {
           
           <div className="flex items-center gap-3">
              {status !== AppStatus.STUDY && status !== AppStatus.REVIEW && (
+                <>
+                 <div className="flex items-center bg-slate-100 rounded-lg px-2 border border-slate-200">
+                    <BrainCircuit size={16} className="text-slate-500 ml-1" />
+                    <select 
+                        value={aiConfig.provider === 'openai' || !MODEL_PRESETS.some(p => p.value === aiConfig.modelName) ? 'custom-config' : aiConfig.modelName}
+                        onChange={handleModelSelectChange}
+                        className="bg-transparent border-none text-sm font-medium text-slate-700 focus:ring-0 py-1.5 pl-2 pr-8 cursor-pointer outline-none w-40"
+                    >
+                        {MODEL_PRESETS.map(preset => (
+                            <option key={preset.value} value={preset.value}>{preset.label}</option>
+                        ))}
+                        <option value="custom-config">External / Custom...</option>
+                    </select>
+                 </div>
+                 
+                 <button 
+                     onClick={() => setIsToolsOpen(true)}
+                     className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-slate-100 rounded-lg transition-colors"
+                     title="PDF Tools"
+                 >
+                     <Wrench size={20} />
+                 </button>
+
+                 <button 
+                     onClick={() => setIsSettingsOpen(true)}
+                     className="p-1.5 text-slate-500 hover:text-indigo-600 hover:bg-slate-100 rounded-lg transition-colors"
+                     title="AI Settings"
+                 >
+                     <Settings size={20} />
+                 </button>
+
                  <div className="flex items-center bg-slate-100 rounded-lg px-2 border border-slate-200">
                     <Globe size={16} className="text-slate-500 ml-1" />
                     <select 
@@ -796,6 +1282,7 @@ export default function App() {
                         <option value="German">Deutsch</option>
                     </select>
                  </div>
+                </>
              )}
 
              <button
@@ -803,7 +1290,7 @@ export default function App() {
                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-600 hover:text-indigo-600 hover:bg-slate-50 rounded-lg transition-colors border border-transparent hover:border-slate-200"
                title="Configure Gemini API Key"
              >
-                <Key size={16} /> <span className="hidden sm:inline">API Key</span>
+                <Key size={16} /> <span className="hidden sm:inline">Google Key</span>
              </button>
           </div>
         </div>
@@ -841,6 +1328,18 @@ export default function App() {
             renderDashboard()
         )}
       </main>
+
+      {/* Settings Modal */}
+      <AISettingsModal />
+      
+      {/* Tools Modal */}
+      <ToolsModal />
+
+      {/* Recovery Modal */}
+      <RecoveryModal />
+      
+      {/* Confirm Dialog */}
+      <ConfirmDialog />
 
       {/* Editor Modal */}
       <CardEditor 

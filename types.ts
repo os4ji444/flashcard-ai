@@ -27,12 +27,21 @@ export interface Deck {
   title: string;
   createdAt: number;
   cards: FlashcardData[];
+  ignoredImages?: ExtractedImage[];
 }
 
 export interface User {
   id: string;
   email: string;
   name: string;
+}
+
+export interface AIConfig {
+  provider: 'google' | 'openai';
+  modelName: string;
+  apiKey: string;
+  baseUrl: string;
+  nickname?: string;
 }
 
 export enum AppStatus {
