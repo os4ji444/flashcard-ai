@@ -42,6 +42,7 @@ export interface AIConfig {
   apiKey: string;
   baseUrl: string;
   nickname?: string;
+  useProxy?: boolean; // New field for CORS proxy
 }
 
 export enum AppStatus {

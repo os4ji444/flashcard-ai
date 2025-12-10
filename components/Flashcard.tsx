@@ -1,7 +1,7 @@
 
 import React, { useState } from 'react';
 import { FlashcardData } from '../types';
-import { RotateCw, Loader2, Edit2, Trash2, AlertCircle } from 'lucide-react';
+import { RotateCw, Loader2, Edit2, Trash2, AlertCircle, Info } from 'lucide-react';
 
 interface FlashcardProps {
   data: FlashcardData;
@@ -11,10 +11,13 @@ interface FlashcardProps {
 
 export const Flashcard: React.FC<FlashcardProps> = ({ data, onEdit, onDelete }) => {
   const [isFlipped, setIsFlipped] = useState(false);
+  const [showErrorDetail, setShowErrorDetail] = useState(false);
 
   const handleFlip = () => {
     if (data.status === 'completed') {
       setIsFlipped(!isFlipped);
+    } else if (data.status === 'error') {
+        setShowErrorDetail(!showErrorDetail);
     }
   };
 
@@ -66,10 +69,22 @@ export const Flashcard: React.FC<FlashcardProps> = ({ data, onEdit, onDelete }) 
 
            {/* Error Overlay */}
            {data.status === 'error' && (
-             <div className="absolute inset-0 bg-red-50/90 flex flex-col items-center justify-center text-red-600 backdrop-blur-sm p-4 text-center z-10">
-                <AlertCircle className="w-8 h-8 mb-2" />
-                <span className="text-sm font-medium">Generation Failed</span>
-                <span className="text-xs mt-1 text-red-500">Retry available above</span>
+             <div className="absolute inset-0 bg-red-50/95 flex flex-col items-center justify-center text-red-600 backdrop-blur-sm p-6 text-center z-10 overflow-y-auto">
+                {showErrorDetail ? (
+                    <div className="text-xs text-left w-full break-words">
+                         <strong className="block mb-2 text-red-800">Error Details:</strong>
+                         {data.description || "Unknown error occurred."}
+                         <button className="mt-4 text-xs underline text-red-500 block text-center w-full">Click to close details</button>
+                    </div>
+                ) : (
+                    <>
+                        <AlertCircle className="w-8 h-8 mb-2" />
+                        <span className="text-sm font-bold">Generation Failed</span>
+                        <span className="text-xs mt-2 text-red-500 px-2">
+                             Click card for error details
+                        </span>
+                    </>
+                )}
              </div>
            )}
 
@@ -81,7 +96,7 @@ export const Flashcard: React.FC<FlashcardProps> = ({ data, onEdit, onDelete }) 
            )}
 
            {/* Action Buttons - Rendered LAST to be on top of everything */}
-           {(data.status === 'completed' || data.status === 'error') && (
+           {(data.status === 'completed' || data.status === 'error') && !showErrorDetail && (
                <div className="absolute top-2 right-2 flex gap-2 z-50">
                    {onEdit && (
                        <button 

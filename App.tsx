@@ -1,9 +1,9 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, FileText, Sparkles, AlertCircle, Loader2, Key, Trash2, Globe, PlayCircle, ArrowLeft, Folder, Plus, RefreshCw, Edit2, Check, Download, Upload as UploadIcon, HardDriveDownload, Eye, CheckSquare, Square, BrainCircuit, Settings, X, Save, EyeOff, RotateCcw, Wrench, Image as ImageIcon, FileCheck, Presentation } from 'lucide-react';
+import { Upload, FileText, Sparkles, AlertCircle, Loader2, Key, Trash2, Globe, PlayCircle, ArrowLeft, Folder, Plus, RefreshCw, Edit2, Check, Download, Upload as UploadIcon, HardDriveDownload, Eye, CheckSquare, Square, BrainCircuit, Settings, X, Save, EyeOff, RotateCcw, Wrench, Image as ImageIcon, FileCheck, Presentation, Wifi, ShieldAlert } from 'lucide-react';
 import { extractImagesFromPdf, convertPdfPagesToImages, createPptxFromPdf } from './services/pdfService';
 import { extractImagesFromPptx } from './services/pptxService';
-import { generateFlashcardContent } from './services/geminiService';
+import { generateFlashcardContent, testConnection } from './services/geminiService';
 import { getUserDecks, saveUserDecks, generateBackup, restoreBackup } from './services/storageService';
 import { Flashcard } from './components/Flashcard';
 import { StudyCard } from './components/StudyCard';
@@ -46,7 +46,8 @@ export default function App() {
         provider: 'google',
         modelName: oldModel || 'gemini-2.5-flash',
         apiKey: '',
-        baseUrl: ''
+        baseUrl: '',
+        useProxy: false
     };
   });
   
@@ -713,15 +714,29 @@ export default function App() {
     
     // Local state for form
     const [localConfig, setLocalConfig] = useState<AIConfig>(aiConfig);
+    const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+    const [testMsg, setTestMsg] = useState('');
 
     const handleSave = () => {
         setAiConfig(localConfig);
         setIsSettingsOpen(false);
     };
 
+    const runTest = async () => {
+        setTestStatus('testing');
+        const res = await testConnection(localConfig);
+        if (res.success) {
+            setTestStatus('success');
+            setTestMsg(res.message);
+        } else {
+            setTestStatus('error');
+            setTestMsg(res.message);
+        }
+    };
+
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in duration-200">
-            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
                 <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
                     <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
                         <Settings size={20} className="text-indigo-600" />
@@ -732,7 +747,7 @@ export default function App() {
                     </button>
                 </div>
 
-                <div className="p-6 space-y-6">
+                <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
                     {/* Provider Selection */}
                     <div>
                         <label className="block text-sm font-medium text-slate-700 mb-3">AI Provider</label>
@@ -772,7 +787,12 @@ export default function App() {
                         <div className="space-y-4">
                             <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800 flex items-start gap-2">
                                 <AlertCircle size={16} className="mt-0.5 shrink-0" />
-                                Use any OpenAI-compatible API (OpenAI, Groq, DeepSeek, LocalAI, etc.)
+                                <div>
+                                    Works with OpenAI, Groq, DeepSeek, LocalAI, etc.
+                                    <div className="mt-1 text-xs text-amber-700/80">
+                                        For DeepSeek, try base url: <code>https://api.deepseek.com</code>
+                                    </div>
+                                </div>
                             </div>
                             
                             <div>
@@ -782,7 +802,7 @@ export default function App() {
                                     value={localConfig.baseUrl}
                                     onChange={e => setLocalConfig({...localConfig, baseUrl: e.target.value})}
                                     className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
-                                    placeholder="https://api.openai.com/v1"
+                                    placeholder="https://api.deepseek.com"
                                 />
                             </div>
 
@@ -797,20 +817,56 @@ export default function App() {
                                 />
                             </div>
 
-                            <div>
-                                <label className="block text-sm font-medium text-slate-700 mb-1">Model Name</label>
-                                <input 
-                                    type="text" 
-                                    value={localConfig.modelName}
-                                    onChange={e => setLocalConfig({...localConfig, modelName: e.target.value})}
-                                    className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
-                                    placeholder="gpt-4o"
-                                />
+                            <div className="flex gap-4">
+                                <div className="flex-1">
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">Model Name</label>
+                                    <input 
+                                        type="text" 
+                                        value={localConfig.modelName}
+                                        onChange={e => setLocalConfig({...localConfig, modelName: e.target.value})}
+                                        className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-indigo-500 outline-none"
+                                        placeholder="deepseek-chat"
+                                    />
+                                </div>
+                            </div>
+                            
+                            <div className="pt-2">
+                                <label className="flex items-start gap-3 p-3 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
+                                    <input 
+                                        type="checkbox"
+                                        checked={localConfig.useProxy || false}
+                                        onChange={e => setLocalConfig({...localConfig, useProxy: e.target.checked})}
+                                        className="mt-1 w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+                                    />
+                                    <div>
+                                        <div className="text-sm font-medium text-slate-800 flex items-center gap-2">
+                                            Enable CORS Proxy
+                                            <ShieldAlert size={14} className="text-amber-500" />
+                                        </div>
+                                        <p className="text-xs text-slate-500 mt-0.5">
+                                            Required for DeepSeek/Groq if you see "Failed to fetch". Routes traffic via corsproxy.io.
+                                        </p>
+                                    </div>
+                                </label>
                             </div>
                         </div>
                     )}
 
-                    <div className="pt-4 flex justify-end gap-3">
+                    <div className="pt-2 flex items-center justify-between border-t border-slate-100 mt-4">
+                         <div className="flex-1 mr-4">
+                             {testStatus === 'testing' && <span className="text-xs text-indigo-600 flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Testing...</span>}
+                             {testStatus === 'success' && <span className="text-xs text-green-600 font-medium">{testMsg}</span>}
+                             {testStatus === 'error' && <span className="text-xs text-red-500 leading-tight block">{testMsg}</span>}
+                         </div>
+                         <button
+                            onClick={runTest}
+                            className="text-xs font-medium text-slate-500 hover:text-indigo-600 underline mr-2"
+                         >
+                            Test Connection
+                         </button>
+                    </div>
+
+                    <div className="flex justify-end gap-3">
                         <button 
                             onClick={() => setIsSettingsOpen(false)}
                             className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg transition-colors font-medium"

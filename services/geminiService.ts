@@ -34,15 +34,13 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Helper to reliably extract JSON from LLM text response
 const extractJson = (text: string) => {
     try {
-        // 1. Try direct parse
-        return JSON.parse(text);
+        // 1. Clean markdown code blocks if present
+        let cleanText = text.replace(/```json\s*|\s*```/g, '');
+        
+        // 2. Try direct parse
+        return JSON.parse(cleanText);
     } catch (e) {
-        // 2. Try markdown extraction
-        const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-        if (match) {
-            try { return JSON.parse(match[1]); } catch (e2) { /* ignore */ }
-        }
-        // 3. Try finding brackets
+        // 3. Try finding the first '{' and last '}'
         const start = text.indexOf('{');
         const end = text.lastIndexOf('}');
         if (start !== -1 && end !== -1) {
@@ -52,28 +50,64 @@ const extractJson = (text: string) => {
     }
 };
 
+const PROXY_URL = "https://corsproxy.io/?";
+
 const generateOpenAIContent = async (base64Image: string, contextText: string, language: string, config: AIConfig) => {
-    const prompt = `
-    You are an expert medical and scientific tutor.
+    // Sanitize Base URL
+    let baseUrl = config.baseUrl.trim();
+    if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
     
-    TASK: Create a flashcard for the medical instrument or object shown in the image.
+    // Construct Endpoint
+    let endpoint = `${baseUrl}/chat/completions`;
     
-    CONTEXT PROVIDED FROM DOCUMENT: 
-    ${contextText.substring(0, 1000)}...
-
-    TARGET LANGUAGE: "${language}"
-
-    OUTPUT FORMAT: JSON ONLY.
-    Structure:
-    {
-      "name": "Name of instrument in ${language}",
-      "description": "Brief description in ${language}",
-      "isValid": boolean (true if valid medical/scientific image, false if text/logo/garbage)
+    // Apply Proxy if enabled
+    if (config.useProxy) {
+        endpoint = PROXY_URL + encodeURIComponent(endpoint);
     }
-    `;
 
-    try {
-        const response = await fetch(`${config.baseUrl}/chat/completions`, {
+    const systemPrompt = "You are a helpful assistant that outputs JSON.";
+    
+    const performFetch = async (useImage: boolean) => {
+        let userContent: any;
+        let prompt = "";
+
+        if (useImage) {
+            prompt = `
+            You are an expert medical and scientific tutor.
+            TASK: Create a flashcard for the medical instrument or object shown in the image.
+            
+            CONTEXT FROM DOCUMENT: 
+            ${contextText.substring(0, 1000)}...
+
+            TARGET LANGUAGE: "${language}"
+
+            OUTPUT: JSON with keys: name, description, isValid (boolean).
+            `;
+            
+            userContent = [
+                { type: "text", text: prompt },
+                { type: "image_url", image_url: { url: base64Image } }
+            ];
+        } else {
+            // Text-Only Fallback Prompt
+            prompt = `
+            You are an expert medical and scientific tutor.
+            
+            The user uploaded a document image, but I cannot send it to you.
+            Infer the content of the "current slide" based on this text context:
+            
+            ${contextText.substring(0, 1500)}...
+
+            TASK: Identify the most likely medical instrument described in the middle of this context.
+            TARGET LANGUAGE: "${language}"
+
+            OUTPUT: JSON with keys: name, description, isValid (boolean).
+            `;
+            
+            userContent = prompt; 
+        }
+
+        const response = await fetch(endpoint, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -82,45 +116,109 @@ const generateOpenAIContent = async (base64Image: string, contextText: string, l
             body: JSON.stringify({
                 model: config.modelName,
                 messages: [
-                    {
-                        role: "system",
-                        content: "You are a helpful assistant that outputs JSON."
-                    },
-                    {
-                        role: "user",
-                        content: [
-                            { type: "text", text: prompt },
-                            { type: "image_url", image_url: { url: base64Image } }
-                        ]
-                    }
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userContent }
                 ],
-                // Attempt to force JSON mode if supported (works on GPT-4o, etc)
-                response_format: { type: "json_object" }
+                temperature: 0.3,
+                max_tokens: 500
             })
         });
 
         if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`External API Error: ${response.status} - ${err}`);
+            const errText = await response.text();
+            throw new Error(`API Error ${response.status}: ${errText}`);
         }
 
-        const data = await response.json();
+        return await response.json();
+    };
+
+    try {
+        // Attempt 1: Try with Image (Multimodal)
+        // DeepSeek-Chat does not support images, so this will likely fail with 400.
+        const data = await performFetch(true);
         const content = data.choices?.[0]?.message?.content;
-        
-        if (!content) throw new Error("No content received from External API");
-
+        if (!content) throw new Error("No content received");
         const json = extractJson(content);
-        if (!json) throw new Error("Failed to parse JSON from External API response");
-
+        if (!json) throw new Error("Failed to parse JSON");
         return json;
 
     } catch (error: any) {
-        console.error("External API Error:", error);
-        // Fallback error object if parsing failed but we handled the exception
-        if (error.message.includes("JSON")) {
-             return { name: "Error", description: "Invalid JSON response from model", isValid: true };
+        const errString = error.toString().toLowerCase();
+        
+        // CRITICAL: If Auth error, do NOT retry.
+        if (errString.includes('401') || errString.includes('unauthorized')) {
+            throw new Error("Invalid API Key (401). Please check your settings.");
         }
-        throw error;
+
+        // If it's a CORS error (Failed to fetch) and proxy is NOT enabled, hint the user
+        if (errString.includes('failed to fetch') && !config.useProxy) {
+            throw new Error("Network Error (CORS). Enable 'CORS Proxy' in Settings to fix this.");
+        }
+
+        // For any other error (400 Bad Request, 422, Network Error w/ Proxy), try Text Fallback
+        console.warn(`Multimodal request failed (${error.message}). Retrying with text-only context...`);
+        
+        try {
+            // Attempt 2: Text Only
+            const data = await performFetch(false);
+            const content = data.choices?.[0]?.message?.content;
+            if (!content) throw new Error("No content received in fallback");
+            const json = extractJson(content);
+            if (!json) throw new Error("Failed to parse JSON in fallback");
+            return json;
+        } catch (fallbackError: any) {
+            console.error("Fallback failed:", fallbackError);
+            
+            let finalMsg = error.message;
+            if (fallbackError.message.includes('failed to fetch') && !config.useProxy) {
+                finalMsg = "Network Error (CORS). Enable 'CORS Proxy' in Settings.";
+            } else {
+                finalMsg = `${error.message} (Fallback: ${fallbackError.message})`;
+            }
+            
+            throw new Error(finalMsg);
+        }
+    }
+};
+
+export const testConnection = async (config: AIConfig): Promise<{ success: boolean; message: string }> => {
+    try {
+        if (config.provider === 'google') {
+            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+            // Simple model list or dummy generation to test
+            const model = ai.getGenerativeModel({ model: "gemini-2.5-flash" });
+            await model.generateContent("Test");
+            return { success: true, message: "Google Gemini connection successful!" };
+        } else {
+            // External
+            let baseUrl = config.baseUrl.trim();
+            if (baseUrl.endsWith('/')) baseUrl = baseUrl.slice(0, -1);
+            let endpoint = `${baseUrl}/chat/completions`;
+            if (config.useProxy) {
+                endpoint = PROXY_URL + encodeURIComponent(endpoint);
+            }
+
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${config.apiKey}`
+                },
+                body: JSON.stringify({
+                    model: config.modelName,
+                    messages: [{ role: "user", content: "Ping" }],
+                    max_tokens: 5
+                })
+            });
+            
+            if (!response.ok) {
+                const txt = await response.text();
+                throw new Error(`Status ${response.status}: ${txt}`);
+            }
+            return { success: true, message: "External API connection successful!" };
+        }
+    } catch (e: any) {
+        return { success: false, message: e.message || "Connection failed" };
     }
 };
 
@@ -129,12 +227,18 @@ export const generateFlashcardContent = async (base64Image: string, contextText:
     // --- External / OpenAI Compatible Provider ---
     if (aiConfig.provider === 'openai') {
         try {
-            return await generateOpenAIContent(base64Image, contextText, language, aiConfig);
+            const result = await generateOpenAIContent(base64Image, contextText, language, aiConfig);
+            // Normalize result
+            return {
+                name: result.name || "Unknown",
+                description: result.description || "No description provided",
+                isValid: result.isValid !== undefined ? result.isValid : true
+            };
         } catch (error: any) {
             return {
                 name: "Error",
-                description: `External API Error: ${error.message}`,
-                isValid: true
+                description: error.message,
+                isValid: true // Keep it as an error card so user can see the message
             };
         }
     }
