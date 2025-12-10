@@ -120,20 +120,45 @@ export const extractImagesFromPptx = async (
                     if (imgFile) {
                         const imgBlob = await imgFile.async('blob');
                         const reader = new FileReader();
-                        const dataUrl = await new Promise<string>((resolve) => {
+                        const rawDataUrl = await new Promise<string>((resolve) => {
                             reader.onload = () => resolve(reader.result as string);
                             reader.readAsDataURL(imgBlob);
                         });
 
-                        // Basic Dimension Check only - No strict pixel analysis
+                        // Resize Image to prevent Memory/Storage Crash
                         const imgObj = new Image();
                         await new Promise<void>((resolve) => {
                             imgObj.onload = () => {
-                                // Keep very small icons out, but allow almost everything else
-                                if (imgObj.width > 15 && imgObj.height > 15) {
+                                // Keep very small icons out
+                                if (imgObj.width < 20 || imgObj.height < 20) {
+                                    resolve();
+                                    return;
+                                }
+
+                                const MAX_DIM = 1024;
+                                let w = imgObj.width;
+                                let h = imgObj.height;
+
+                                // Scale down if too big
+                                if (w > MAX_DIM || h > MAX_DIM) {
+                                    const ratio = Math.min(MAX_DIM / w, MAX_DIM / h);
+                                    w = Math.round(w * ratio);
+                                    h = Math.round(h * ratio);
+                                }
+
+                                const canvas = document.createElement('canvas');
+                                canvas.width = w;
+                                canvas.height = h;
+                                const ctx = canvas.getContext('2d');
+                                
+                                if (ctx) {
+                                    ctx.drawImage(imgObj, 0, 0, w, h);
+                                    // Use PNG to preserve transparency, but at reduced resolution
+                                    const resizedDataUrl = canvas.toDataURL('image/png');
+
                                     uniqueImages.set(targetPath, {
-                                        id: `pptx-${pageNum}-${embedId}-${Date.now()}`,
-                                        dataUrl,
+                                        id: `pptx-${pageNum}-${embedId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                                        dataUrl: resizedDataUrl,
                                         pageIndex: pageNum,
                                         contextText: fullContext
                                     });
@@ -141,7 +166,7 @@ export const extractImagesFromPptx = async (
                                 resolve();
                             };
                             imgObj.onerror = () => resolve();
-                            imgObj.src = dataUrl;
+                            imgObj.src = rawDataUrl;
                         });
                     }
                 };
@@ -152,20 +177,18 @@ export const extractImagesFromPptx = async (
                     await processEmbedId(blips[b].getAttribute('r:embed'));
                 }
 
-                // 2. Legacy VML Images (v:imagedata) - Often used for copy-pasted images
+                // 2. Legacy VML Images (v:imagedata)
                 const vImages = slideDoc.getElementsByTagName('v:imagedata');
                 for(let v=0; v<vImages.length; v++) {
                     await processEmbedId(vImages[v].getAttribute('r:id') || vImages[v].getAttribute('o:relid'));
                 }
 
-                // 3. Alternate Content (pic:blipFill) - Catch all elements with r:embed just in case
-                // This is a "catch-all" scan for any tag having r:embed if it wasn't caught above
+                // 3. Alternate Content catch-all
                 const allEls = slideDoc.getElementsByTagName('*');
                 for(let elIdx=0; elIdx<allEls.length; elIdx++) {
                     const el = allEls[elIdx];
                     const embed = el.getAttribute('r:embed');
                     if(embed && relMap.has(embed)) {
-                        // If standard blip scan missed it or it's a weird tag
                         const target = relMap.get(embed)!;
                         let resolvedPath = target.startsWith('../') ? 'ppt/' + target.substring(3) : 'ppt/slides/' + target;
                         resolvedPath = resolvedPath.replace('//', '/');

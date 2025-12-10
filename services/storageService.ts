@@ -106,7 +106,11 @@ export const getUserDecks = (userId: string): Deck[] => {
 };
 
 export const saveUserDecks = (userId: string, decks: Deck[]) => {
-  localStorage.setItem(`flashcard-ai-decks-${userId}`, JSON.stringify(decks));
+  try {
+      localStorage.setItem(`flashcard-ai-decks-${userId}`, JSON.stringify(decks));
+  } catch (e) {
+      console.warn("Failed to save decks to localStorage (Quota likely exceeded). Data is preserved in memory for this session, but will be lost on refresh.", e);
+  }
 };
 
 // --- Export / Import (Manual Cloud Sync) ---
